@@ -59,7 +59,8 @@ func main() {
 - **Handshake**：`GET` + HTTP/1.1+；`Connection`/`Upgrade` 令牌包含 `upgrade`/`websocket`；
   `Sec-WebSocket-Key` 为合法的 16 字节 base64 nonce；`Sec-WebSocket-Version: 13`。
   响应值 `Sec-WebSocket-Accept = base64(SHA1(key + 258EAFA5-E914-47DA-95CA-C5AB0DC85B11))`。
-  任一校验失败返回 HTTP 400 并关闭底层连接，不进入帧阶段。
+  任一校验失败返回 HTTP 400；服务已停止接受新连接时返回 HTTP 503。
+  两种拒绝都会在写完错误响应后**关闭底层 TCP 连接**，不进入帧阶段。
 - **Open**：可收发数据帧与控制帧。
 - **Closing**：`sync.Once` 保证 close 帧只发送一次；先排空已入队的应用数据，
   再写 close 帧；本端发起的关闭等待对端 close 回复，等待受 `CloseTimeout` 上界约束；
@@ -154,6 +155,28 @@ c.Done()           // 连接回收完成的信号
 - 本端先 close 时：排空待发数据 → 发 close → 等对端回复或 `CloseTimeout`。
 - 并发双方同时发起 close 时（`TestConcurrentCloseRace` 覆盖）不会死锁或重复发送。
 
+## 升级拒绝与服务停摆
+
+**拒绝路径的连接回收**：所有被拒绝的升级请求（握手头非法/缺失 → 400，
+服务已停止接受新连接 → 503）在写完错误响应后立即关闭底层 TCP 连接。
+客户端读完错误响应后再次读取会立刻得到 EOF，同一连接上无法再发起任何请求
+（响应带 `Connection: close`，实现上优先 Hijack 后直接关闭）。被拒绝的请求
+不进入帧处理阶段、不计入 `ConnCount`、不残留任何后台读写 goroutine；
+拒绝不影响服务可用性，后续合法升级照常接受。
+
+**停摆语义（`Server.Close`）**：
+
+- 不再接受新升级：停摆进行中到达的升级请求一律 503 拒绝并关闭连接；
+  连接注册与停摆判断在同一把锁下原子完成，不存在"停摆返回后仍有新连接漏入"的窗口。
+- 所有存活连接**并发**执行关闭握手，每条连接都会及时收到 close 帧。
+  不应答 close 帧的对端在单个连接的 `CloseTimeout` 上界内被强制回收，
+  且不会拖慢其他连接：整体停摆耗时 ≈ 单个 `CloseTimeout`，
+  与静默对端数量无关（不线性增长）。
+- `Close` 幂等且可并发调用：重复/并发调用不 panic、不挂起、不重复发送 close 帧；
+  每次调用都会等到其启动时在册的连接全部收尾完成。
+- `Close` 返回时 `ConnCount() == 0`，所有连接的读/写/看门狗 goroutine 均已退出，
+  不残留连接相关的后台活动。
+
 ## 测试
 
 ```
@@ -165,4 +188,55 @@ go test -race ./...
 UTF-8、控制帧穿插、关闭握手（本端/对端/同时发起、静默超时、幂等、待发数据
 先于 close）、背压（队列满阻塞、关闭即解除、慢连接不影响他人）、帧/消息大小
 限制、心跳 ping/pong、pong 超时、空闲回收与活动保护，以及基于 `httptest` 的
-端到端升级、连接计数和服务关停。
+端到端升级、连接计数和服务关停。针对拒绝与停摆的专项覆盖：
+
+- 拒绝路径（`reject_test.go`）：原始 TCP 客户端逐类验证非法/缺失头、
+  服务停摆等拒绝原因下，读完错误响应后立即读到 EOF（连接真正关闭）、
+  同一连接上的后续请求（含流水线请求）不会成功；并发 64 路非法请求后
+  `ConnCount == 0` 且 goroutine 数回落到基线。
+- 停摆路径（`shutdown_test.go`）：静默对端与正常对端混合（1 个与 8 个静默
+  对端耗时均 ≈ 单个 `CloseTimeout`）、8 路并发 + 重复 `Close` 幂等不挂起、
+  停摆与新建连接竞态（25 轮）、停摆后 `ConnCount == 0` 且 goroutine 数回落。
+
+### 本地复现与验证
+
+复现"拒绝后连接未关闭"（修复前行为）：启动服务后用原始 TCP 发送非法升级请求，
+读完 400 响应后再读，修复前会阻塞直至超时，修复后立即得到 EOF：
+
+```
+go run ./cmd/echo &            # 或任何挂载该 Server 的程序；监听 :8080
+
+# 方式一：curl 观察连接去向
+curl -sv http://localhost:8080/ 2>&1 | grep -E 'Connection|Closing|left intact'
+# 修复前：* Connection #0 to host localhost left intact（连接保持，可被复用）
+# 修复后：< Connection: close 与 * Closing connection（服务端已关闭连接）
+
+# 方式二：python 原始 socket 观察 EOF
+python3 -c "
+import socket
+s = socket.create_connection(('localhost', 8080))
+s.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
+data = b''
+while True:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+print(data.decode(), end='')
+print('=> server closed the connection (EOF)')
+"
+# 修复前：recv 一直阻塞（连接不关闭，只能 Ctrl+C 退出）
+# 修复后：打印 400 响应后立即输出 "=> server closed the connection (EOF)"
+```
+
+复现"停摆耗时随静默对端数线性增长"（修复前行为）：对静默对端（不应答 close 帧）
+调用 `Server.Close`，修复前 N 个静默对端耗时 N×`CloseTimeout`（串行回收），
+修复后 ≈ 1×`CloseTimeout`（并发回收）。
+
+自动化验证：
+
+```
+go test -race ./...                                        # 全量
+go test -run 'Reject|ServerUsable|UpgradeAfterServerClose' # 拒绝路径
+go test -run 'TestServerClose|TestServerShutdown'          # 停摆路径
+```
