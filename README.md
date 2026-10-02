@@ -154,6 +154,89 @@ c.Done()           // 连接回收完成的信号
 - 本端先 close 时：排空待发数据 → 发 close → 等对端回复或 `CloseTimeout`。
 - 并发双方同时发起 close 时（`TestConcurrentCloseRace` 覆盖）不会死锁或重复发送。
 
+## 拒绝升级的连接回收
+
+所有未能升级成功的请求，写完错误响应后都会**立即关闭底层 TCP 连接**，客户端读完
+错误响应后的下一次读操作立刻得到 EOF/RST（连接关闭信号），同一连接上不能再发起
+任何请求。拒绝路径不创建 `Conn`、不启动任何帧处理 goroutine，因此不会进入帧处理
+阶段、不会出现在 `ConnCount()` 中，也不残留后台读写活动。
+
+拒绝原因与状态码（保持原有约定）：
+
+| 场景 | 状态码 |
+|------|--------|
+| 方法/协议版本/`Connection`/`Upgrade`/`Sec-WebSocket-Key`/`Sec-WebSocket-Version` 非法或缺失 | `400 Bad Request` |
+| 服务已停摆（`Close` 已开始或完成）后到达的升级请求（无论头是否合法） | `503 Service Unavailable` |
+| 运行环境不支持 Hijack（理论场景） | `500 Internal Server Error` |
+
+实现上，服务优先 Hijack 底层连接并手写带 `Connection: close` 的 HTTP 错误响应，
+`Flush` 后直接 `net.Conn.Close()`，因此回收行为不依赖 `net/http` 的 keep-alive
+决策；写错误响应受 `WriteTimeout` 约束，对端窗口为零时也不会拖住回收。无法
+Hijack 的退化场景则通过响应头 `Connection: close` 指示 `net/http` 在响应后关闭
+传输层。一次拒绝风暴结束后服务保持可用，后续合法升级与正常连接不受影响
+（`TestManyRejectedRequestsLeaveNoResidue`、`TestRejectedUpgradeClosesTCP` 覆盖）。
+
+## 服务停摆（`Server.Close`）语义
+
+- **并发关闭**：停摆时对**每条存活连接并发**执行关闭握手，而不是串行逐个等待。
+  因此整体停摆耗时上界接近**单个连接**的关闭耗时——排空待发数据（每帧 flush 受
+  `WriteTimeout` 约束）后发送 close 帧，再等待 `CloseTimeout`——与不应答 close
+  帧的静默对端数量无关，一个异常对端不会拖慢其他连接退出。实测 2 个与 30 个静默
+  对端的停摆耗时都约为单个 `CloseTimeout`
+  （`TestShutdownDurationIndependentOfSilentPeerCount` 覆盖并断言两者无倍数关系）。
+- **全员收到 close**：每条存活连接都会及时收到 close 帧；静默对端在单个
+  `CloseTimeout` 上界到达后被强制回收，正常应答的对端完成握手后立即回收
+  （`TestShutdownMixedPeersBounded` 覆盖混合场景）。
+- **新连接竞态**：`Close` 在同一把锁内完成“标记停止接受”与快照存活连接。
+  停摆开始后到达的升级请求一律得到 `503` 且底层连接被关闭；101 与停摆之间没有
+  可逃逸的窗口——升级要么在发送 101 前被注册并由停摆关闭，要么被明确拒绝
+  （`TestShutdownRaceWithNewConnections` 覆盖）。
+- **返回即清空**：`Close` 返回后 `ConnCount()` 必为 0，所有连接的 read/write/
+  watchdog 循环 goroutine 均已退出，不残留任何连接相关后台活动
+  （`TestShutdownLeavesNoBackgroundGoroutines` 覆盖）。
+- **幂等可并发**：`Close` 可重复调用、可被多个 goroutine 并发调用；只有第一次
+  调用发起停摆并触发 close 帧，重复调用不重发 close 帧、不干扰进行中的握手，
+  不 panic、不挂起（`TestConcurrentRepeatedShutdown` 覆盖，并逐连接校验恰好收到
+  一个 close 帧）。
+
+### 本地复现与验证
+
+用原始 TCP 客户端即可复现“400 后连接不关闭”的问题：连上服务端后只发送
+`GET / HTTP/1.1\r\nHost: x\r\n\r\n`，读完 400 响应后再次 `Read`。修复前该读会
+一直阻塞直到读超时，连接还可被复用；修复后立即得到 EOF。停摆问题可通过建立 N
+个完成握手但从不读/不回复的静默连接、再调用 `Close` 复现：修复前耗时约为
+`N × CloseTimeout`，修复后恒为约一个 `CloseTimeout`。
+
+```bash
+# 全量测试（含 -race）
+go test -race ./...
+
+# 只跑拒绝回收与停摆语义测试
+go test -race -run 'Reject|Shutdown' -v ./...
+
+# 重复运行检查偶发竞态
+go test -race -count=10 -run 'Reject|Shutdown' ./...
+```
+
+关键测试：
+
+- `TestRejectedUpgradeClosesTCP`：表驱动覆盖 8 种非法/缺失头组合，断言状态码为
+  400、响应后下一次读立即得到关闭信号（显式区分“超时未关闭”与真正的 EOF/RST）、
+  管道内再次发送升级请求不会成功、`ConnCount()` 为 0。
+- `TestRejectedUpgradeDuringShutdownClosesTCP`：停摆后合法与非法请求均得到 503
+  且 TCP 被关闭。
+- `TestManyRejectedRequestsLeaveNoResidue`：200 路并发非法请求后无连接残留、
+  goroutine 数不增长，且后续合法升级收发正常。
+- `TestShutdownMixedPeersBounded` / `TestShutdownDurationIndependentOfSilentPeerCount`：
+  静默与正常对端混合、大量连接，断言每个对端都收到 close 帧、停摆耗时上界与静默
+  对端数量无关、停摆后 `ConnCount()` 为 0。
+- `TestConcurrentRepeatedShutdown`：8 路并发 + 重复停摆，断言全部及时返回、恰好
+  一个 close 帧/连接、计数归零。
+- `TestShutdownRaceWithNewConnections`：40 路新建连接与停摆并发，已接受的连接
+  收到 close 帧、被拒的连接得到 503 + EOF，停摆返回后新建连接同样被拒。
+- `TestShutdownLeavesNoBackgroundGoroutines`：30 个连接停摆后 goroutine 数回落至
+  建连前基线。
+
 ## 测试
 
 ```
